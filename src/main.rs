@@ -1,0 +1,1118 @@
+use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
+use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
+use std::env;
+use std::ffi::OsString;
+use std::fs;
+use std::fs::OpenOptions;
+use std::io::{self, Read, Write};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::process::{self, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+const INTERNAL_SERVER_ARG: &str = "--coder-server";
+const STATE_VERSION: u32 = 1;
+const RING_LIMIT: usize = 1024 * 1024;
+
+const FRAME_STDOUT: u8 = 1;
+const FRAME_EXIT: u8 = 2;
+const FRAME_STDIN: u8 = 10;
+const FRAME_RESIZE: u8 = 11;
+const FRAME_DETACH: u8 = 12;
+
+const DETACH_HINT: &str = "\r\n[coder] Detached. Run `coder` again to reattach.\r\n";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ServerConfig {
+    version: u32,
+    session: String,
+    cwd: PathBuf,
+    args: Vec<String>,
+    state_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SessionState {
+    version: u32,
+    session: String,
+    port: u16,
+    server_pid: u32,
+    cwd: PathBuf,
+    args: Vec<String>,
+    started_at_ms: u128,
+}
+
+#[derive(Debug)]
+struct ClientOptions {
+    session: String,
+    codex_args: Vec<String>,
+}
+
+#[derive(Clone)]
+struct ClientSink {
+    id: u64,
+    tx: mpsc::Sender<ServerMessage>,
+}
+
+enum ServerMessage {
+    Output(Vec<u8>),
+    Exit(i32),
+}
+
+struct Shared {
+    current_client: Mutex<Option<ClientSink>>,
+    pty_writer: Mutex<Option<Box<dyn Write + Send>>>,
+    pty_master: Mutex<Option<Box<dyn MasterPty + Send>>>,
+    ring: Mutex<VecDeque<u8>>,
+    exit_code: Mutex<Option<i32>>,
+    oom_detected: AtomicBool,
+    next_client_id: AtomicU64,
+}
+
+struct RunningCodex {
+    exit_rx: mpsc::Receiver<i32>,
+    pty_done_rx: mpsc::Receiver<()>,
+}
+
+struct RawModeGuard {
+    enabled: bool,
+}
+
+impl RawModeGuard {
+    fn enable() -> Self {
+        let enabled = crossterm::terminal::enable_raw_mode().is_ok();
+        Self { enabled }
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        if self.enabled {
+            let _ = crossterm::terminal::disable_raw_mode();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ResolvedCodexCommand {
+    program: OsString,
+    args: Vec<OsString>,
+}
+
+fn main() {
+    if let Err(err) = run() {
+        eprintln!("coder: {err}");
+        process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
+    debug_log("run start");
+    let mut args = env::args().skip(1).collect::<Vec<_>>();
+
+    if args.first().map(String::as_str) == Some(INTERNAL_SERVER_ARG) {
+        if args.len() != 2 {
+            return Err(format!("{INTERNAL_SERVER_ARG} expects a config path").into());
+        }
+
+        let config_path = PathBuf::from(args.remove(1));
+        let text = fs::read_to_string(&config_path)?;
+        let config = serde_json::from_str::<ServerConfig>(&text)?;
+        debug_log(format!(
+            "server mode session={} args={}",
+            config.session,
+            config.args.join(" ")
+        ));
+        return run_server(config);
+    }
+
+    let options = parse_client_args(args);
+
+    let state_path = state_path(&options.session)?;
+
+    if should_attach_to_existing(&options.codex_args)
+        && let Some(stream) = connect_existing(&state_path)?
+    {
+        let code = run_client(stream)?;
+        process::exit(code);
+    }
+
+    if should_run_codex_direct(&options.codex_args) {
+        let code = run_codex_direct(&options.codex_args)?;
+        process::exit(code);
+    }
+
+    if state_path.exists() && !should_attach_to_existing(&options.codex_args) {
+        let code = run_codex_direct(&options.codex_args)?;
+        process::exit(code);
+    }
+
+    let config_path = write_server_config(&options.session, &state_path, &options.codex_args)?;
+    start_detached_server(&config_path)?;
+
+    let stream = wait_for_server(&state_path, Duration::from_secs(10))?;
+    let code = run_client(stream)?;
+    process::exit(code);
+}
+
+fn parse_client_args(args: Vec<String>) -> ClientOptions {
+    let session = env::var("CODER_SESSION")
+        .map(|value| sanitize_session_name(&value))
+        .unwrap_or_else(|_| "default".to_string());
+
+    ClientOptions {
+        session,
+        codex_args: args,
+    }
+}
+
+fn sanitize_session_name(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+            out.push(ch);
+        }
+    }
+
+    if out.is_empty() {
+        "default".to_string()
+    } else {
+        out
+    }
+}
+
+fn should_attach_to_existing(args: &[String]) -> bool {
+    args.is_empty() || first_positional(args).as_deref() == Some("resume")
+}
+
+fn should_run_codex_direct(args: &[String]) -> bool {
+    if args.is_empty() {
+        return false;
+    }
+
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "--version" | "-V"))
+    {
+        return true;
+    }
+
+    match first_positional(args).as_deref() {
+        Some("resume") => false,
+        Some(command) => is_direct_codex_command(command),
+        None => has_unknown_option(args),
+    }
+}
+
+fn is_direct_codex_command(command: &str) -> bool {
+    matches!(
+        command,
+        "exec"
+            | "e"
+            | "review"
+            | "login"
+            | "logout"
+            | "mcp"
+            | "plugin"
+            | "mcp-server"
+            | "app-server"
+            | "remote-control"
+            | "app"
+            | "completion"
+            | "update"
+            | "doctor"
+            | "sandbox"
+            | "debug"
+            | "apply"
+            | "a"
+            | "fork"
+            | "cloud"
+            | "features"
+            | "help"
+    )
+}
+
+fn has_unknown_option(args: &[String]) -> bool {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == "--" {
+            return false;
+        }
+
+        if option_takes_value(arg) {
+            i += if has_inline_value(arg) { 1 } else { 2 };
+            continue;
+        }
+
+        if arg.starts_with('-') {
+            if is_known_flag(arg) {
+                i += 1;
+                continue;
+            }
+
+            return true;
+        }
+
+        return false;
+    }
+
+    false
+}
+
+fn first_positional(args: &[String]) -> Option<String> {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == "--" {
+            return None;
+        }
+
+        if option_takes_value(arg) {
+            i += if has_inline_value(arg) { 1 } else { 2 };
+            continue;
+        }
+
+        if arg.starts_with('-') {
+            i += 1;
+            continue;
+        }
+
+        return Some(arg.to_string());
+    }
+
+    None
+}
+
+fn option_takes_value(arg: &str) -> bool {
+    matches!(
+        arg,
+        "-c" | "--config"
+            | "-i"
+            | "--image"
+            | "-m"
+            | "--model"
+            | "--local-provider"
+            | "-p"
+            | "--profile"
+            | "-s"
+            | "--sandbox"
+            | "-C"
+            | "--cd"
+            | "--add-dir"
+            | "-a"
+            | "--ask-for-approval"
+            | "--remote"
+            | "--remote-auth-token-env"
+            | "--enable"
+            | "--disable"
+    ) || arg.starts_with("--config=")
+        || arg.starts_with("--image=")
+        || arg.starts_with("--model=")
+        || arg.starts_with("--local-provider=")
+        || arg.starts_with("--profile=")
+        || arg.starts_with("--sandbox=")
+        || arg.starts_with("--cd=")
+        || arg.starts_with("--add-dir=")
+        || arg.starts_with("--ask-for-approval=")
+        || arg.starts_with("--remote=")
+        || arg.starts_with("--remote-auth-token-env=")
+        || arg.starts_with("--enable=")
+        || arg.starts_with("--disable=")
+}
+
+fn has_inline_value(arg: &str) -> bool {
+    arg.starts_with("--") && arg.contains('=')
+}
+
+fn is_known_flag(arg: &str) -> bool {
+    matches!(
+        arg,
+        "--oss"
+            | "--strict-config"
+            | "--dangerously-bypass-approvals-and-sandbox"
+            | "--dangerously-bypass-hook-trust"
+            | "--search"
+            | "--no-alt-screen"
+    )
+}
+
+fn app_dir() -> Result<PathBuf> {
+    let base = env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("APPDATA").map(PathBuf::from))
+        .unwrap_or_else(env::temp_dir);
+    let dir = base.join("coder");
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+fn state_path(session: &str) -> Result<PathBuf> {
+    Ok(app_dir()?.join(format!("{session}.state.json")))
+}
+
+fn config_path(session: &str) -> Result<PathBuf> {
+    Ok(app_dir()?.join(format!("{session}.config.json")))
+}
+
+fn write_server_config(session: &str, state_path: &Path, codex_args: &[String]) -> Result<PathBuf> {
+    let config = ServerConfig {
+        version: STATE_VERSION,
+        session: session.to_string(),
+        cwd: env::current_dir()?,
+        args: codex_args.to_vec(),
+        state_path: state_path.to_path_buf(),
+    };
+
+    let path = config_path(session)?;
+    fs::write(&path, serde_json::to_vec_pretty(&config)?)?;
+    let _ = fs::remove_file(state_path);
+    Ok(path)
+}
+
+fn start_detached_server(config_path: &Path) -> Result<()> {
+    let exe = env::current_exe()?;
+    let mut command = Command::new(exe);
+    command
+        .arg(INTERNAL_SERVER_ARG)
+        .arg(config_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(windows)]
+    {
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW);
+    }
+
+    command.spawn()?;
+    Ok(())
+}
+
+fn connect_existing(state_path: &Path) -> Result<Option<TcpStream>> {
+    if !state_path.exists() {
+        return Ok(None);
+    }
+
+    let state = match read_state(state_path) {
+        Ok(state) => state,
+        Err(_) => {
+            let _ = fs::remove_file(state_path);
+            return Ok(None);
+        }
+    };
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], state.port));
+    match TcpStream::connect_timeout(&addr, Duration::from_millis(500)) {
+        Ok(stream) => {
+            stream.set_nodelay(true).ok();
+            Ok(Some(stream))
+        }
+        Err(_) => {
+            let _ = fs::remove_file(state_path);
+            Ok(None)
+        }
+    }
+}
+
+fn wait_for_server(state_path: &Path, timeout: Duration) -> Result<TcpStream> {
+    let started = SystemTime::now();
+    loop {
+        if let Some(stream) = connect_existing(state_path)? {
+            return Ok(stream);
+        }
+
+        if started.elapsed().unwrap_or_default() > timeout {
+            return Err("timed out waiting for coder broker to start".into());
+        }
+
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn read_state(state_path: &Path) -> Result<SessionState> {
+    Ok(serde_json::from_slice(&fs::read(state_path)?)?)
+}
+
+fn write_state(config: &ServerConfig, listener: &TcpListener) -> Result<()> {
+    let port = listener.local_addr()?.port();
+    let state = SessionState {
+        version: STATE_VERSION,
+        session: config.session.clone(),
+        port,
+        server_pid: process::id(),
+        cwd: config.cwd.clone(),
+        args: config.args.clone(),
+        started_at_ms: now_ms(),
+    };
+
+    fs::write(&config.state_path, serde_json::to_vec_pretty(&state)?)?;
+    Ok(())
+}
+
+fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+fn run_server(config: ServerConfig) -> Result<()> {
+    debug_log(format!("server start session={}", config.session));
+    env::set_current_dir(&config.cwd)?;
+
+    let listener = TcpListener::bind(("127.0.0.1", 0))?;
+    listener.set_nonblocking(true)?;
+    write_state(&config, &listener)?;
+    debug_log(format!("server listen {}", listener.local_addr()?));
+
+    let shared = Arc::new(Shared {
+        current_client: Mutex::new(None),
+        pty_writer: Mutex::new(None),
+        pty_master: Mutex::new(None),
+        ring: Mutex::new(VecDeque::with_capacity(RING_LIMIT)),
+        exit_code: Mutex::new(None),
+        oom_detected: AtomicBool::new(false),
+        next_client_id: AtomicU64::new(1),
+    });
+
+    let mut running = Some(spawn_codex_process(&config, Arc::clone(&shared))?);
+    let mut restart_at = None::<Instant>;
+    let mut exit_seen_at = None::<Instant>;
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                debug_log("server accepted client");
+                stream.set_nodelay(true).ok();
+                stream.set_nonblocking(false).ok();
+                let client_shared = Arc::clone(&shared);
+                thread::spawn(move || handle_client(stream, client_shared));
+            }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(err) => return Err(err.into()),
+        }
+
+        if let Some(when) = restart_at
+            && Instant::now() >= when
+        {
+            broadcast_notice(
+                &shared,
+                "\r\n[coder] Restarting Codex after out-of-memory crash.\r\n",
+            );
+            running = Some(spawn_codex_process(&config, Arc::clone(&shared))?);
+            restart_at = None;
+        }
+
+        if exit_seen_at.is_none()
+            && restart_at.is_none()
+            && let Some(active) = running.as_ref()
+        {
+            if let Some((code, reason)) = poll_codex_exit(active) {
+                if should_restart_after_exit(&shared, code) {
+                    schedule_oom_restart(&shared, code);
+                    running = None;
+                    restart_at = Some(Instant::now() + oom_restart_delay());
+                } else {
+                    mark_session_exited(&config.state_path, &shared, code, reason);
+                    exit_seen_at = Some(Instant::now());
+                }
+            }
+        }
+
+        if exit_seen_at
+            .map(|seen| seen.elapsed() > Duration::from_secs(2))
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+    }
+}
+
+fn spawn_codex_process(config: &ServerConfig, shared: Arc<Shared>) -> Result<RunningCodex> {
+    shared.oom_detected.store(false, Ordering::Relaxed);
+    *shared.exit_code.lock().expect("exit code mutex poisoned") = None;
+
+    let pty_system = native_pty_system();
+    let pair = pty_system.openpty(PtySize {
+        rows: 30,
+        cols: 120,
+        pixel_width: 0,
+        pixel_height: 0,
+    })?;
+
+    let resolved = resolve_codex_command(&config.args);
+    let mut command = CommandBuilder::new(&resolved.program);
+    for arg in resolved.args {
+        command.arg(arg);
+    }
+    command.cwd(&config.cwd);
+
+    let mut child = pair.slave.spawn_command(command)?;
+    drop(pair.slave);
+
+    let mut reader = pair.master.try_clone_reader()?;
+    let writer = pair.master.take_writer()?;
+    *shared.pty_writer.lock().expect("pty writer mutex poisoned") = Some(writer);
+    *shared.pty_master.lock().expect("pty master mutex poisoned") = Some(pair.master);
+
+    let (pty_done_tx, pty_done_rx) = mpsc::channel();
+    let output_shared = Arc::clone(&shared);
+    thread::spawn(move || read_pty_output(&mut reader, output_shared, pty_done_tx));
+
+    let (exit_tx, exit_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let code = match child.wait() {
+            Ok(status) => status.exit_code() as i32,
+            Err(_) => 1,
+        };
+        let _ = exit_tx.send(code);
+    });
+
+    Ok(RunningCodex {
+        exit_rx,
+        pty_done_rx,
+    })
+}
+
+fn poll_codex_exit(active: &RunningCodex) -> Option<(i32, &'static str)> {
+    if let Ok(code) = active.exit_rx.try_recv() {
+        Some((code, "child exit"))
+    } else if active.pty_done_rx.try_recv().is_ok() {
+        Some((0, "pty closed"))
+    } else {
+        None
+    }
+}
+
+fn mark_session_exited(state_path: &Path, shared: &Shared, code: i32, reason: &str) {
+    debug_log(format!("{reason} code={code}"));
+    let _ = fs::remove_file(state_path);
+    *shared.pty_writer.lock().expect("pty writer mutex poisoned") = None;
+    *shared.pty_master.lock().expect("pty master mutex poisoned") = None;
+    *shared.exit_code.lock().expect("exit code mutex poisoned") = Some(code);
+    let notice = format!("\r\n[coder] codex exited with code {code}\r\n").into_bytes();
+    push_ring(shared, &notice);
+    broadcast_output(shared, notice);
+    broadcast_exit(shared, code);
+}
+
+fn should_restart_after_exit(shared: &Shared, code: i32) -> bool {
+    shared.oom_detected.load(Ordering::Relaxed) || is_oom_exit_code(code)
+}
+
+fn is_oom_exit_code(code: i32) -> bool {
+    matches!(code, 134 | 137 | -1073741801)
+}
+
+fn schedule_oom_restart(shared: &Shared, code: i32) {
+    debug_log(format!("oom restart scheduled code={code}"));
+    *shared.pty_writer.lock().expect("pty writer mutex poisoned") = None;
+    *shared.pty_master.lock().expect("pty master mutex poisoned") = None;
+    *shared.exit_code.lock().expect("exit code mutex poisoned") = None;
+    let delay = oom_restart_delay();
+    let notice = format!(
+        "\r\n[coder] Codex appears to have exited due to out of memory (code {code}). Restarting in {} seconds.\r\n",
+        delay.as_secs()
+    );
+    broadcast_notice(shared, &notice);
+}
+
+fn oom_restart_delay() -> Duration {
+    env::var("CODER_OOM_RESTART_DELAY_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(180))
+}
+
+fn broadcast_notice(shared: &Shared, notice: &str) {
+    let bytes = notice.as_bytes().to_vec();
+    push_ring(shared, &bytes);
+    broadcast_output(shared, bytes);
+}
+
+fn read_pty_output(
+    reader: &mut Box<dyn Read + Send>,
+    shared: Arc<Shared>,
+    done_tx: mpsc::Sender<()>,
+) {
+    let mut buf = [0u8; 8192];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                debug_log(format!("pty output bytes={n}"));
+                let chunk = buf[..n].to_vec();
+                if looks_like_oom_output(&chunk) {
+                    shared.oom_detected.store(true, Ordering::Relaxed);
+                }
+                respond_to_terminal_queries(&shared, &chunk);
+                push_ring(&shared, &chunk);
+                broadcast_output(&shared, chunk);
+            }
+            Err(_) => break,
+        }
+    }
+    debug_log("pty output reader ended");
+    let _ = done_tx.send(());
+}
+
+fn looks_like_oom_output(chunk: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(chunk).to_ascii_lowercase();
+    text.contains("javascript heap out of memory")
+        || text.contains("heap out of memory")
+        || text.contains("allocation failed")
+        || text.contains("reached heap limit")
+        || text.contains("fatal process out of memory")
+        || text.contains("out of memory")
+}
+
+fn respond_to_terminal_queries(shared: &Shared, chunk: &[u8]) {
+    let mut response = Vec::new();
+
+    if contains_bytes(chunk, b"\x1b[5n") {
+        response.extend_from_slice(b"\x1b[0n");
+    }
+
+    if contains_bytes(chunk, b"\x1b[6n") {
+        response.extend_from_slice(b"\x1b[1;1R");
+    }
+
+    if contains_bytes(chunk, b"\x1b[?6n") {
+        response.extend_from_slice(b"\x1b[?1;1R");
+    }
+
+    if response.is_empty() {
+        return;
+    }
+
+    let mut writer = shared.pty_writer.lock().expect("pty writer mutex poisoned");
+    if let Some(writer) = writer.as_mut() {
+        let _ = writer.write_all(&response);
+        let _ = writer.flush();
+    }
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+fn push_ring(shared: &Shared, chunk: &[u8]) {
+    let mut ring = shared.ring.lock().expect("ring mutex poisoned");
+    ring.extend(chunk.iter().copied());
+    while ring.len() > RING_LIMIT {
+        ring.pop_front();
+    }
+}
+
+fn broadcast_output(shared: &Shared, chunk: Vec<u8>) {
+    let current = shared
+        .current_client
+        .lock()
+        .expect("current client mutex poisoned")
+        .clone();
+
+    if let Some(client) = current {
+        let _ = client.tx.send(ServerMessage::Output(chunk));
+    }
+}
+
+fn broadcast_exit(shared: &Shared, code: i32) {
+    let current = shared
+        .current_client
+        .lock()
+        .expect("current client mutex poisoned")
+        .clone();
+
+    if let Some(client) = current {
+        let _ = client.tx.send(ServerMessage::Exit(code));
+    }
+}
+
+fn handle_client(mut stream: TcpStream, shared: Arc<Shared>) {
+    let client_id = shared.next_client_id.fetch_add(1, Ordering::Relaxed);
+    debug_log(format!("client {client_id} handler start"));
+    let (tx, rx) = mpsc::channel();
+
+    {
+        let mut current = shared
+            .current_client
+            .lock()
+            .expect("current client mutex poisoned");
+        *current = Some(ClientSink {
+            id: client_id,
+            tx: tx.clone(),
+        });
+    }
+
+    let mut initial = b"\x1b[2J\x1b[H".to_vec();
+    {
+        let ring = shared.ring.lock().expect("ring mutex poisoned");
+        initial.extend(ring.iter().copied());
+    }
+    let _ = tx.send(ServerMessage::Output(initial));
+
+    if let Some(code) = *shared.exit_code.lock().expect("exit code mutex poisoned") {
+        let _ = tx.send(ServerMessage::Exit(code));
+    }
+
+    drop(tx);
+
+    let mut write_stream = match stream.try_clone() {
+        Ok(stream) => stream,
+        Err(_) => return,
+    };
+
+    thread::spawn(move || {
+        while let Ok(message) = rx.recv() {
+            match message {
+                ServerMessage::Output(chunk) => {
+                    if write_frame(&mut write_stream, FRAME_STDOUT, &chunk).is_err() {
+                        debug_log("client writer output send failed");
+                        break;
+                    }
+                }
+                ServerMessage::Exit(code) => {
+                    let _ = write_frame(&mut write_stream, FRAME_EXIT, &code.to_le_bytes());
+                    debug_log(format!("client writer sent exit={code}"));
+                    break;
+                }
+            }
+        }
+        debug_log("client writer ended");
+    });
+
+    let mut clear_current = false;
+    loop {
+        let frame = match read_frame(&mut stream) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => {
+                debug_log(format!("client {client_id} input eof"));
+                break;
+            }
+            Err(err) => {
+                debug_log(format!("client {client_id} input error {err}"));
+                break;
+            }
+        };
+
+        if !is_current_client(&shared, client_id) {
+            debug_log(format!("client {client_id} no longer current"));
+            break;
+        }
+
+        let (kind, payload) = frame;
+        match kind {
+            FRAME_STDIN => {
+                let mut writer = shared.pty_writer.lock().expect("pty writer mutex poisoned");
+                if let Some(writer) = writer.as_mut() {
+                    if writer.write_all(&payload).is_err() {
+                        break;
+                    }
+                    let _ = writer.flush();
+                }
+            }
+            FRAME_RESIZE if payload.len() == 4 => {
+                let cols = u16::from_le_bytes([payload[0], payload[1]]);
+                let rows = u16::from_le_bytes([payload[2], payload[3]]);
+                let mut master = shared.pty_master.lock().expect("pty master mutex poisoned");
+                if let Some(master) = master.as_mut() {
+                    let _ = master.resize(PtySize {
+                        rows,
+                        cols,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    });
+                }
+            }
+            FRAME_DETACH => {
+                debug_log(format!("client {client_id} explicit detach"));
+                clear_current = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    debug_log(format!("client {client_id} input loop ended"));
+    if clear_current {
+        let mut current = shared
+            .current_client
+            .lock()
+            .expect("current client mutex poisoned");
+        if current
+            .as_ref()
+            .map(|client| client.id == client_id)
+            .unwrap_or(false)
+        {
+            *current = None;
+        }
+    }
+}
+
+fn is_current_client(shared: &Shared, client_id: u64) -> bool {
+    shared
+        .current_client
+        .lock()
+        .expect("current client mutex poisoned")
+        .as_ref()
+        .map(|client| client.id == client_id)
+        .unwrap_or(false)
+}
+
+fn run_client(mut stream: TcpStream) -> Result<i32> {
+    debug_log("foreground client start");
+    stream.set_nodelay(true).ok();
+    let mut input_stream = stream.try_clone()?;
+    send_resize(&mut input_stream)?;
+    debug_log("foreground sent resize");
+
+    let _raw = RawModeGuard::enable();
+    let input_running = Arc::new(AtomicBool::new(true));
+    let input_running_thread = Arc::clone(&input_running);
+    thread::spawn(move || {
+        let mut stdin = io::stdin().lock();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = match stdin.read(&mut buf) {
+                Ok(0) => {
+                    debug_log("foreground stdin eof");
+                    wait_with_socket_alive(&input_running_thread, &input_stream);
+                    break;
+                }
+                Ok(n) => n,
+                Err(_) => {
+                    debug_log("foreground stdin error");
+                    wait_with_socket_alive(&input_running_thread, &input_stream);
+                    break;
+                }
+            };
+
+            if buf[..n].contains(&0x1d) {
+                debug_log("foreground detach requested");
+                let _ = write_frame(&mut input_stream, FRAME_DETACH, &[]);
+                let _ = io::stdout().write_all(DETACH_HINT.as_bytes());
+                let _ = io::stdout().flush();
+                let _ = input_stream.shutdown(Shutdown::Both);
+                break;
+            }
+
+            let filtered = normalize_terminal_input(&buf[..n]);
+            if filtered.is_empty() {
+                continue;
+            }
+
+            if write_frame(&mut input_stream, FRAME_STDIN, &filtered).is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut stdout = io::stdout().lock();
+    let mut exit_code = 0;
+    while let Some((kind, payload)) = read_frame(&mut stream)? {
+        match kind {
+            FRAME_STDOUT => {
+                debug_log(format!("foreground stdout frame bytes={}", payload.len()));
+                stdout.write_all(&payload)?;
+                stdout.flush()?;
+            }
+            FRAME_EXIT => {
+                debug_log("foreground exit frame");
+                if payload.len() == 4 {
+                    exit_code =
+                        i32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                }
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    debug_log("foreground read loop ended");
+    input_running.store(false, Ordering::Relaxed);
+    Ok(exit_code)
+}
+
+fn wait_with_socket_alive(running: &AtomicBool, stream: &TcpStream) {
+    while running.load(Ordering::Relaxed) {
+        let _ = stream.peer_addr();
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn normalize_terminal_input(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+
+    while i < input.len() {
+        if input[i] == 0x1b && i + 2 < input.len() && input[i + 1] == b'[' {
+            let mut j = i + 2;
+            if j < input.len() && input[j] == b'?' {
+                j += 1;
+            }
+
+            let digits_start = j;
+            while j < input.len() && (input[j].is_ascii_digit() || input[j] == b';') {
+                j += 1;
+            }
+
+            if j < input.len() && (input[j] == b'R' || input[j] == b'n') && j > digits_start {
+                i = j + 1;
+                continue;
+            }
+        }
+
+        if input[i] == 0x7f {
+            out.push(0x08);
+        } else {
+            out.push(input[i]);
+        }
+        i += 1;
+    }
+
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_del_to_windows_backspace() {
+        assert_eq!(normalize_terminal_input(b"abc\x7f"), b"abc\x08");
+    }
+
+    #[test]
+    fn strips_terminal_status_reports() {
+        assert_eq!(normalize_terminal_input(b"a\x1b[1;2Rb\x1b[0nc"), b"abc");
+    }
+
+    #[test]
+    fn detects_oom_output() {
+        assert!(looks_like_oom_output(
+            b"FATAL ERROR: Reached heap limit Allocation failed"
+        ));
+        assert!(looks_like_oom_output(b"JavaScript heap out of memory"));
+    }
+
+    #[test]
+    fn detects_oom_exit_codes() {
+        assert!(is_oom_exit_code(134));
+        assert!(is_oom_exit_code(137));
+        assert!(is_oom_exit_code(-1073741801));
+        assert!(!is_oom_exit_code(0));
+    }
+}
+
+fn send_resize(stream: &mut TcpStream) -> io::Result<()> {
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 30));
+    let mut payload = Vec::with_capacity(4);
+    payload.extend(cols.to_le_bytes());
+    payload.extend(rows.to_le_bytes());
+    write_frame(stream, FRAME_RESIZE, &payload)
+}
+
+fn write_frame<W: Write>(writer: &mut W, kind: u8, payload: &[u8]) -> io::Result<()> {
+    if payload.len() > u32::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "frame payload too large",
+        ));
+    }
+
+    writer.write_all(&[kind])?;
+    writer.write_all(&(payload.len() as u32).to_le_bytes())?;
+    writer.write_all(payload)?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn read_frame<R: Read>(reader: &mut R) -> io::Result<Option<(u8, Vec<u8>)>> {
+    let mut header = [0u8; 5];
+    match reader.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(err) if err.kind() == io::ErrorKind::ConnectionReset => return Ok(None),
+        Err(err) if err.kind() == io::ErrorKind::ConnectionAborted => return Ok(None),
+        Err(err) => return Err(err),
+    }
+
+    let len = u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as usize;
+    if len > 8 * 1024 * 1024 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame payload too large",
+        ));
+    }
+
+    let mut payload = vec![0u8; len];
+    reader.read_exact(&mut payload)?;
+    Ok(Some((header[0], payload)))
+}
+
+fn resolve_codex_command(codex_args: &[String]) -> ResolvedCodexCommand {
+    if let Some(command) = env::var_os("CODER_CODEX") {
+        return ResolvedCodexCommand {
+            program: command,
+            args: codex_args.iter().map(OsString::from).collect(),
+        };
+    }
+
+    let node = PathBuf::from(r"C:\Programs\nodejs\node.exe");
+    let codex_js = PathBuf::from(r"C:\Programs\nodejs\node_modules\@openai\codex\bin\codex.js");
+    if node.exists() && codex_js.exists() {
+        let mut args = vec![codex_js.into_os_string()];
+        args.extend(codex_args.iter().map(OsString::from));
+        return ResolvedCodexCommand {
+            program: node.into_os_string(),
+            args,
+        };
+    }
+
+    ResolvedCodexCommand {
+        program: OsString::from("codex"),
+        args: codex_args.iter().map(OsString::from).collect(),
+    }
+}
+
+fn run_codex_direct(codex_args: &[String]) -> Result<i32> {
+    let resolved = resolve_codex_command(codex_args);
+    let status = Command::new(&resolved.program)
+        .args(&resolved.args)
+        .status()?;
+    Ok(status.code().unwrap_or(1))
+}
+
+fn debug_log(message: impl AsRef<str>) {
+    let Some(path) = env::var_os("CODER_DEBUG_LOG") else {
+        return;
+    };
+
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(
+            file,
+            "{} pid={} {}",
+            now_ms(),
+            process::id(),
+            message.as_ref()
+        );
+    }
+}
