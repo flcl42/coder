@@ -2,6 +2,7 @@
 name = "coder"
 version = "1.0.0"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
 crossterm = "0.29"
