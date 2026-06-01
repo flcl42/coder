@@ -1,0 +1,119 @@
+name: release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - "v*"
+      - "release/*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+      - run: cargo test --locked
+
+  build-linux:
+    name: build linux x86_64
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --locked --release --target x86_64-unknown-linux-musl
+      - run: |
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/coder dist/coder-linux-x86_64
+          strip dist/coder-linux-x86_64
+          ldd dist/coder-linux-x86_64 2>&1 | grep -Eq "not a dynamic executable|statically linked"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coder-linux-x86_64
+          path: dist/coder-linux-x86_64
+          if-no-files-found: error
+          compression-level: 0
+
+  build-windows:
+    name: build windows x86_64
+    needs: check
+    runs-on: windows-latest
+    env:
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - run: cargo build --locked --release --target x86_64-pc-windows-msvc
+      - shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target\x86_64-pc-windows-msvc\release\coder.exe dist\coder-windows-x86_64.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coder-windows-x86_64.exe
+          path: dist/coder-windows-x86_64.exe
+          if-no-files-found: error
+          compression-level: 0
+
+  build-macos:
+    name: build macos universal
+    needs: check
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+      - run: cargo build --locked --release --target x86_64-apple-darwin
+      - run: cargo build --locked --release --target aarch64-apple-darwin
+      - run: |
+          mkdir -p dist
+          lipo -create \
+            target/x86_64-apple-darwin/release/coder \
+            target/aarch64-apple-darwin/release/coder \
+            -output dist/coder-macos-universal
+          strip dist/coder-macos-universal
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coder-macos-universal
+          path: dist/coder-macos-universal
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    name: publish release
+    needs:
+      - build-linux
+      - build-windows
+      - build-macos
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          files: release-assets/*

@@ -1,10 +1,13 @@
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::collections::hash_map::DefaultHasher;
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::fs::OpenOptions;
+use std::hash::{Hash, Hasher};
+use std::io::IsTerminal;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -156,6 +159,7 @@ fn run() -> Result<()> {
         process::exit(code);
     }
 
+    ensure_codex_available(&options.codex_args)?;
     let config_path = write_server_config(&options.session, &state_path, &options.codex_args)?;
     start_detached_server(&config_path)?;
 
@@ -167,12 +171,33 @@ fn run() -> Result<()> {
 fn parse_client_args(args: Vec<String>) -> ClientOptions {
     let session = env::var("CODER_SESSION")
         .map(|value| sanitize_session_name(&value))
-        .unwrap_or_else(|_| "default".to_string());
+        .unwrap_or_else(|_| derived_session_name(&args).unwrap_or_else(|| "default".to_string()));
 
     ClientOptions {
         session,
         codex_args: args,
     }
+}
+
+fn derived_session_name(args: &[String]) -> Option<String> {
+    let resume_index = first_positional_index(args)?;
+    if args.get(resume_index).map(String::as_str) != Some("resume") {
+        return None;
+    }
+
+    let resume_args = &args[resume_index + 1..];
+    if resume_args.is_empty() {
+        return None;
+    }
+
+    if let Some(target) = resume_target(resume_args) {
+        return Some(resume_session_name(&target));
+    }
+
+    Some(format!(
+        "resume-{}",
+        short_hash(&(env::current_dir().ok(), args))
+    ))
 }
 
 fn sanitize_session_name(value: &str) -> String {
@@ -188,6 +213,45 @@ fn sanitize_session_name(value: &str) -> String {
     } else {
         out
     }
+}
+
+fn resume_session_name(target: &str) -> String {
+    let sanitized = sanitize_session_name(target);
+    if sanitized.len() <= 80 {
+        format!("resume-{sanitized}")
+    } else {
+        format!("resume-{}", short_hash(&target))
+    }
+}
+
+fn short_hash<T: Hash>(value: &T) -> String {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn resume_target(args: &[String]) -> Option<String> {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == "--" {
+            return args.get(i + 1).cloned();
+        }
+
+        if option_takes_value(arg) {
+            i += if has_inline_value(arg) { 1 } else { 2 };
+            continue;
+        }
+
+        if arg.starts_with('-') {
+            i += 1;
+            continue;
+        }
+
+        return Some(arg.to_string());
+    }
+
+    None
 }
 
 fn should_attach_to_existing(args: &[String]) -> bool {
@@ -270,6 +334,10 @@ fn has_unknown_option(args: &[String]) -> bool {
 }
 
 fn first_positional(args: &[String]) -> Option<String> {
+    first_positional_index(args).map(|index| args[index].to_string())
+}
+
+fn first_positional_index(args: &[String]) -> Option<usize> {
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
@@ -287,7 +355,7 @@ fn first_positional(args: &[String]) -> Option<String> {
             continue;
         }
 
-        return Some(arg.to_string());
+        return Some(i);
     }
 
     None
@@ -344,6 +412,126 @@ fn is_known_flag(arg: &str) -> bool {
             | "--search"
             | "--no-alt-screen"
     )
+}
+
+fn modifier_code(modifiers: crossterm::event::KeyModifiers) -> Option<u8> {
+    let shift = modifiers.contains(crossterm::event::KeyModifiers::SHIFT);
+    let alt = modifiers.contains(crossterm::event::KeyModifiers::ALT);
+    let ctrl = modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
+
+    match (shift, alt, ctrl) {
+        (false, false, false) => None,
+        (true, false, false) => Some(2),
+        (false, true, false) => Some(3),
+        (true, true, false) => Some(4),
+        (false, false, true) => Some(5),
+        (true, false, true) => Some(6),
+        (false, true, true) => Some(7),
+        (true, true, true) => Some(8),
+    }
+}
+
+fn modified_csi(final_byte: char, modifiers: crossterm::event::KeyModifiers) -> Vec<u8> {
+    if let Some(code) = modifier_code(modifiers) {
+        format!("\x1b[1;{code}{final_byte}").into_bytes()
+    } else {
+        format!("\x1b[{final_byte}").into_bytes()
+    }
+}
+
+fn modified_tilde(prefix: u8, modifiers: crossterm::event::KeyModifiers) -> Vec<u8> {
+    if let Some(code) = modifier_code(modifiers) {
+        format!("\x1b[{prefix};{code}~").into_bytes()
+    } else {
+        format!("\x1b[{prefix}~").into_bytes()
+    }
+}
+
+fn encode_key_event(event: crossterm::event::KeyEvent) -> Option<Vec<u8>> {
+    use crossterm::event::KeyCode;
+    use crossterm::event::KeyModifiers;
+
+    if matches!(event.kind, crossterm::event::KeyEventKind::Release) {
+        return None;
+    }
+
+    let modifiers = event.modifiers;
+    let alt_prefix = modifiers
+        .contains(KeyModifiers::ALT)
+        .then(|| vec![0x1b])
+        .unwrap_or_default();
+
+    let mut encoded = match event.code {
+        KeyCode::Backspace => vec![0x7f],
+        KeyCode::Enter => vec![b'\r'],
+        KeyCode::Left => modified_csi('D', modifiers),
+        KeyCode::Right => modified_csi('C', modifiers),
+        KeyCode::Up => modified_csi('A', modifiers),
+        KeyCode::Down => modified_csi('B', modifiers),
+        KeyCode::Home => modified_csi('H', modifiers),
+        KeyCode::End => modified_csi('F', modifiers),
+        KeyCode::PageUp => modified_tilde(5, modifiers),
+        KeyCode::PageDown => modified_tilde(6, modifiers),
+        KeyCode::Tab => vec![b'\t'],
+        KeyCode::BackTab => b"\x1b[Z".to_vec(),
+        KeyCode::Delete => modified_tilde(3, modifiers),
+        KeyCode::Insert => modified_tilde(2, modifiers),
+        KeyCode::Esc => vec![0x1b],
+        KeyCode::F(number) => encode_function_key(number, modifiers),
+        KeyCode::Char(ch) if modifiers.contains(KeyModifiers::CONTROL) => encode_control_char(ch)?,
+        KeyCode::Char(ch) => ch.to_string().into_bytes(),
+        _ => return None,
+    };
+
+    if modifiers.contains(KeyModifiers::ALT) && !matches!(event.code, KeyCode::Esc) {
+        let mut prefixed = alt_prefix;
+        prefixed.append(&mut encoded);
+        Some(prefixed)
+    } else {
+        Some(encoded)
+    }
+}
+
+fn encode_control_char(ch: char) -> Option<Vec<u8>> {
+    let lower = ch.to_ascii_lowercase();
+    match lower {
+        '@' | ' ' => Some(vec![0x00]),
+        '[' => Some(vec![0x1b]),
+        '\\' => Some(vec![0x1c]),
+        ']' => Some(vec![0x1d]),
+        '^' => Some(vec![0x1e]),
+        '_' => Some(vec![0x1f]),
+        'a'..='z' => Some(vec![(lower as u8) - b'a' + 1]),
+        _ => None,
+    }
+}
+
+fn encode_function_key(number: u8, modifiers: crossterm::event::KeyModifiers) -> Vec<u8> {
+    let base = match number {
+        1 => return modified_ss3_or_csi('P', modifiers),
+        2 => return modified_ss3_or_csi('Q', modifiers),
+        3 => return modified_ss3_or_csi('R', modifiers),
+        4 => return modified_ss3_or_csi('S', modifiers),
+        5 => 15,
+        6 => 17,
+        7 => 18,
+        8 => 19,
+        9 => 20,
+        10 => 21,
+        11 => 23,
+        12 => 24,
+        _ => return Vec::new(),
+    };
+
+    modified_tilde(base, modifiers)
+}
+
+fn modified_ss3_or_csi(final_byte: char, modifiers: crossterm::event::KeyModifiers) -> Vec<u8> {
+    if let Some(code) = modifier_code(modifiers) {
+        format!("\x1b[1;{code}{final_byte}").into_bytes()
+    } else {
+        format!("\x1bO{final_byte}").into_bytes()
+    }
 }
 
 fn app_dir() -> Result<PathBuf> {
@@ -888,40 +1076,10 @@ fn run_client(mut stream: TcpStream) -> Result<i32> {
     let input_running = Arc::new(AtomicBool::new(true));
     let input_running_thread = Arc::clone(&input_running);
     thread::spawn(move || {
-        let mut stdin = io::stdin().lock();
-        let mut buf = [0u8; 4096];
-        loop {
-            let n = match stdin.read(&mut buf) {
-                Ok(0) => {
-                    debug_log("foreground stdin eof");
-                    wait_with_socket_alive(&input_running_thread, &input_stream);
-                    break;
-                }
-                Ok(n) => n,
-                Err(_) => {
-                    debug_log("foreground stdin error");
-                    wait_with_socket_alive(&input_running_thread, &input_stream);
-                    break;
-                }
-            };
-
-            if buf[..n].contains(&0x1d) {
-                debug_log("foreground detach requested");
-                let _ = write_frame(&mut input_stream, FRAME_DETACH, &[]);
-                let _ = io::stdout().write_all(DETACH_HINT.as_bytes());
-                let _ = io::stdout().flush();
-                let _ = input_stream.shutdown(Shutdown::Both);
-                break;
-            }
-
-            let filtered = normalize_terminal_input(&buf[..n]);
-            if filtered.is_empty() {
-                continue;
-            }
-
-            if write_frame(&mut input_stream, FRAME_STDIN, &filtered).is_err() {
-                break;
-            }
+        if io::stdin().is_terminal() {
+            run_event_input_loop(&input_running_thread, &mut input_stream);
+        } else {
+            run_byte_input_loop(&input_running_thread, &mut input_stream);
         }
     });
 
@@ -958,6 +1116,92 @@ fn wait_with_socket_alive(running: &AtomicBool, stream: &TcpStream) {
     }
 }
 
+fn run_event_input_loop(running: &AtomicBool, input_stream: &mut TcpStream) {
+    while running.load(Ordering::Relaxed) {
+        let event = match crossterm::event::read() {
+            Ok(event) => event,
+            Err(err) => {
+                debug_log(format!("foreground event input error {err}"));
+                wait_with_socket_alive(running, input_stream);
+                break;
+            }
+        };
+
+        match event {
+            crossterm::event::Event::Key(key) => {
+                let Some(encoded) = encode_key_event(key) else {
+                    continue;
+                };
+
+                if encoded.contains(&0x1d) {
+                    detach_input_stream(input_stream);
+                    break;
+                }
+
+                if write_frame(input_stream, FRAME_STDIN, &encoded).is_err() {
+                    break;
+                }
+            }
+            crossterm::event::Event::Paste(text) => {
+                if write_frame(input_stream, FRAME_STDIN, text.as_bytes()).is_err() {
+                    break;
+                }
+            }
+            crossterm::event::Event::Resize(cols, rows) => {
+                let mut payload = Vec::with_capacity(4);
+                payload.extend(cols.to_le_bytes());
+                payload.extend(rows.to_le_bytes());
+                if write_frame(input_stream, FRAME_RESIZE, &payload).is_err() {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn run_byte_input_loop(running: &AtomicBool, input_stream: &mut TcpStream) {
+    let mut stdin = io::stdin().lock();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = match stdin.read(&mut buf) {
+            Ok(0) => {
+                debug_log("foreground stdin eof");
+                wait_with_socket_alive(running, input_stream);
+                break;
+            }
+            Ok(n) => n,
+            Err(_) => {
+                debug_log("foreground stdin error");
+                wait_with_socket_alive(running, input_stream);
+                break;
+            }
+        };
+
+        if buf[..n].contains(&0x1d) {
+            detach_input_stream(input_stream);
+            break;
+        }
+
+        let filtered = normalize_terminal_input(&buf[..n]);
+        if filtered.is_empty() {
+            continue;
+        }
+
+        if write_frame(input_stream, FRAME_STDIN, &filtered).is_err() {
+            break;
+        }
+    }
+}
+
+fn detach_input_stream(input_stream: &mut TcpStream) {
+    debug_log("foreground detach requested");
+    let _ = write_frame(input_stream, FRAME_DETACH, &[]);
+    let _ = io::stdout().write_all(DETACH_HINT.as_bytes());
+    let _ = io::stdout().flush();
+    let _ = input_stream.shutdown(Shutdown::Both);
+}
+
 fn normalize_terminal_input(input: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(input.len());
     let mut i = 0;
@@ -980,11 +1224,7 @@ fn normalize_terminal_input(input: &[u8]) -> Vec<u8> {
             }
         }
 
-        if input[i] == 0x7f {
-            out.push(0x08);
-        } else {
-            out.push(input[i]);
-        }
+        out.push(input[i]);
         i += 1;
     }
 
@@ -996,8 +1236,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalizes_del_to_windows_backspace() {
-        assert_eq!(normalize_terminal_input(b"abc\x7f"), b"abc\x08");
+    fn preserves_del_backspace_byte_input() {
+        assert_eq!(normalize_terminal_input(b"abc\x7f"), b"abc\x7f");
+    }
+
+    #[test]
+    fn encodes_backspace_as_del() {
+        let event = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Backspace,
+            crossterm::event::KeyModifiers::NONE,
+        );
+
+        assert_eq!(encode_key_event(event).as_deref(), Some(&b"\x7f"[..]));
+    }
+
+    #[test]
+    fn encodes_shift_arrows() {
+        let event = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Left,
+            crossterm::event::KeyModifiers::SHIFT,
+        );
+
+        assert_eq!(encode_key_event(event).as_deref(), Some(&b"\x1b[1;2D"[..]));
     }
 
     #[test]
@@ -1019,6 +1279,42 @@ mod tests {
         assert!(is_oom_exit_code(137));
         assert!(is_oom_exit_code(-1073741801));
         assert!(!is_oom_exit_code(0));
+    }
+
+    #[test]
+    fn detects_missing_path_like_codex_command() {
+        let missing = OsStr::new(r"C:\this\path\does-not-exist\codex.exe");
+        assert!(!command_exists(missing));
+    }
+
+    #[test]
+    fn derives_distinct_session_for_targeted_resume() {
+        let args = vec![
+            "resume".to_string(),
+            "--cd".to_string(),
+            ".".to_string(),
+            "019e3fd6-0c53-7302-8c84-3f9d47d0370b".to_string(),
+        ];
+
+        assert_eq!(
+            derived_session_name(&args).as_deref(),
+            Some("resume-019e3fd6-0c53-7302-8c84-3f9d47d0370b")
+        );
+    }
+
+    #[test]
+    fn plain_resume_uses_default_session() {
+        assert_eq!(derived_session_name(&["resume".to_string()]), None);
+    }
+
+    #[test]
+    fn resume_with_options_but_no_target_is_not_default() {
+        let args = vec!["resume".to_string(), "--last".to_string()];
+        assert!(
+            derived_session_name(&args)
+                .as_deref()
+                .is_some_and(|value| value.starts_with("resume-"))
+        );
     }
 }
 
@@ -1093,8 +1389,73 @@ fn resolve_codex_command(codex_args: &[String]) -> ResolvedCodexCommand {
     }
 }
 
-fn run_codex_direct(codex_args: &[String]) -> Result<i32> {
+fn ensure_codex_available(codex_args: &[String]) -> Result<ResolvedCodexCommand> {
     let resolved = resolve_codex_command(codex_args);
+    if command_exists(&resolved.program) {
+        Ok(resolved)
+    } else {
+        Err(format!(
+            "Codex executable was not found: {}. Install the Codex CLI so `codex` is on PATH, or set CODER_CODEX to the Codex executable path.",
+            display_command(&resolved.program)
+        )
+        .into())
+    }
+}
+
+fn command_exists(program: &OsStr) -> bool {
+    let path = Path::new(program);
+    if is_path_like(path) {
+        return path.is_file();
+    }
+
+    let Some(path_var) = env::var_os("PATH") else {
+        return false;
+    };
+
+    for dir in env::split_paths(&path_var) {
+        let candidate = dir.join(path);
+        if candidate.is_file() {
+            return true;
+        }
+
+        #[cfg(windows)]
+        {
+            if candidate.extension().is_none() {
+                for extension in windows_path_extensions() {
+                    let mut with_extension = candidate.as_os_str().to_os_string();
+                    with_extension.push(&extension);
+                    if PathBuf::from(with_extension).is_file() {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn is_path_like(path: &Path) -> bool {
+    path.is_absolute() || path.components().count() > 1
+}
+
+#[cfg(windows)]
+fn windows_path_extensions() -> Vec<OsString> {
+    env::var_os("PATHEXT")
+        .unwrap_or_else(|| OsString::from(".COM;.EXE;.BAT;.CMD"))
+        .to_string_lossy()
+        .split(';')
+        .filter(|extension| !extension.is_empty())
+        .map(OsString::from)
+        .collect()
+}
+
+fn display_command(command: &OsStr) -> String {
+    Path::new(command).display().to_string()
+}
+
+fn run_codex_direct(codex_args: &[String]) -> Result<i32> {
+    let resolved = ensure_codex_available(codex_args)?;
     let status = Command::new(&resolved.program)
         .args(&resolved.args)
         .status()?;
