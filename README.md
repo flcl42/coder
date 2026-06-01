@@ -40,13 +40,19 @@ alive and restarts Codex after 3 minutes.
 Release assets are unpacked single binaries. Linux is built with musl, Windows is
 built with the static CRT, and macOS is shipped as a universal binary.
 
+Linux, bash:
+
 ```bash
 repo=flcl42/coder; mkdir -p "$HOME/.local/bin"; curl -fsSL "https://github.com/$repo/releases/latest/download/coder-linux-x86_64" -o "$HOME/.local/bin/coder"; chmod +x "$HOME/.local/bin/coder"; grep -qxF 'export PATH="$HOME/.local/bin:$PATH"' "$HOME/.bashrc" || echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc"
 ```
 
+macOS, zsh:
+
 ```zsh
 repo=flcl42/coder; mkdir -p "$HOME/.local/bin"; curl -fsSL "https://github.com/$repo/releases/latest/download/coder-macos-universal" -o "$HOME/.local/bin/coder"; chmod +x "$HOME/.local/bin/coder"; grep -qxF 'export PATH="$HOME/.local/bin:$PATH"' "$HOME/.zshrc" || echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.zshrc"
 ```
+
+Windows, PowerShell:
 
 ```powershell
 $repo='flcl42/coder'; $dir='C:\Programs'; New-Item -ItemType Directory -Force $dir | Out-Null; Invoke-WebRequest "https://github.com/$repo/releases/latest/download/coder-windows-x86_64.exe" -OutFile "$dir\coder.exe"; $p=[Environment]::GetEnvironmentVariable('Path','User'); if (($p -split ';') -notcontains $dir) { [Environment]::SetEnvironmentVariable('Path', ((@($p -split ';') + $dir | Where-Object { $_ }) -join ';'), 'User'); $env:Path += ";$dir" }
