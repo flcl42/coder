@@ -1,6 +1,6 @@
 # coder
 
-`coder.exe` is a detachable wrapper for `codex`.
+`coder` is a cross-platform detachable wrapper for `codex`.
 
 It starts `codex` inside a background broker process that owns the pseudo-terminal.
 The foreground `coder` process only attaches your current terminal to that broker.
