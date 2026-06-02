@@ -79,6 +79,10 @@ struct Shared {
     exit_code: Mutex<Option<i32>>,
     oom_detected: AtomicBool,
     next_client_id: AtomicU64,
+    terminal_cols: AtomicU64,
+    terminal_rows: AtomicU64,
+    cursor_col: AtomicU64,
+    cursor_row: AtomicU64,
 }
 
 struct RunningCodex {
@@ -456,10 +460,18 @@ fn encode_key_event(event: crossterm::event::KeyEvent) -> Option<Vec<u8>> {
     }
 
     let modifiers = event.modifiers;
-    let alt_prefix = modifiers
-        .contains(KeyModifiers::ALT)
-        .then(|| vec![0x1b])
-        .unwrap_or_default();
+    let alt_gr_printable = matches!(
+        event.code,
+        KeyCode::Char(ch)
+            if modifiers.contains(KeyModifiers::ALT)
+                && modifiers.contains(KeyModifiers::CONTROL)
+                && !ch.is_control()
+    );
+    let alt_prefix = if modifiers.contains(KeyModifiers::ALT) && !alt_gr_printable {
+        vec![0x1b]
+    } else {
+        Vec::new()
+    };
 
     let mut encoded = match event.code {
         KeyCode::Backspace => vec![0x7f],
@@ -478,12 +490,16 @@ fn encode_key_event(event: crossterm::event::KeyEvent) -> Option<Vec<u8>> {
         KeyCode::Insert => modified_tilde(2, modifiers),
         KeyCode::Esc => vec![0x1b],
         KeyCode::F(number) => encode_function_key(number, modifiers),
+        KeyCode::Char(ch) if alt_gr_printable => ch.to_string().into_bytes(),
         KeyCode::Char(ch) if modifiers.contains(KeyModifiers::CONTROL) => encode_control_char(ch)?,
         KeyCode::Char(ch) => ch.to_string().into_bytes(),
         _ => return None,
     };
 
-    if modifiers.contains(KeyModifiers::ALT) && !matches!(event.code, KeyCode::Esc) {
+    if modifiers.contains(KeyModifiers::ALT)
+        && !alt_gr_printable
+        && !matches!(event.code, KeyCode::Esc)
+    {
         let mut prefixed = alt_prefix;
         prefixed.append(&mut encoded);
         Some(prefixed)
@@ -674,6 +690,10 @@ fn run_server(config: ServerConfig) -> Result<()> {
         exit_code: Mutex::new(None),
         oom_detected: AtomicBool::new(false),
         next_client_id: AtomicU64::new(1),
+        terminal_cols: AtomicU64::new(120),
+        terminal_rows: AtomicU64::new(30),
+        cursor_col: AtomicU64::new(1),
+        cursor_row: AtomicU64::new(1),
     });
 
     let mut running = Some(spawn_codex_process(&config, Arc::clone(&shared))?);
@@ -844,11 +864,14 @@ fn read_pty_output(
             Ok(0) => break,
             Ok(n) => {
                 debug_log(format!("pty output bytes={n}"));
-                let chunk = buf[..n].to_vec();
-                if looks_like_oom_output(&chunk) {
+                let raw = &buf[..n];
+                if looks_like_oom_output(raw) {
                     shared.oom_detected.store(true, Ordering::Relaxed);
                 }
-                respond_to_terminal_queries(&shared, &chunk);
+                let chunk = process_terminal_output(&shared, raw);
+                if chunk.is_empty() {
+                    continue;
+                }
                 push_ring(&shared, &chunk);
                 broadcast_output(&shared, chunk);
             }
@@ -869,24 +892,65 @@ fn looks_like_oom_output(chunk: &[u8]) -> bool {
         || text.contains("out of memory")
 }
 
-fn respond_to_terminal_queries(shared: &Shared, chunk: &[u8]) {
-    let mut response = Vec::new();
+#[derive(Clone, Copy)]
+enum TerminalQuery {
+    Status,
+    CursorPosition,
+    DecCursorPosition,
+}
 
-    if contains_bytes(chunk, b"\x1b[5n") {
-        response.extend_from_slice(b"\x1b[0n");
+fn process_terminal_output(shared: &Shared, chunk: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(chunk.len());
+    let mut i = 0;
+
+    while i < chunk.len() {
+        if let Some((query, len)) = terminal_query_at(&chunk[i..]) {
+            answer_terminal_query(shared, query);
+            i += len;
+            continue;
+        }
+
+        if chunk[i] == 0x1b
+            && let Some(len) = ansi_escape_len(&chunk[i..])
+        {
+            update_cursor_from_escape(shared, &chunk[i..i + len]);
+            output.extend_from_slice(&chunk[i..i + len]);
+            i += len;
+            continue;
+        }
+
+        update_cursor_from_byte(shared, chunk[i]);
+        output.push(chunk[i]);
+        i += 1;
     }
 
-    if contains_bytes(chunk, b"\x1b[6n") {
-        response.extend_from_slice(b"\x1b[1;1R");
-    }
+    output
+}
 
-    if contains_bytes(chunk, b"\x1b[?6n") {
-        response.extend_from_slice(b"\x1b[?1;1R");
+fn terminal_query_at(input: &[u8]) -> Option<(TerminalQuery, usize)> {
+    if input.starts_with(b"\x1b[?6n") {
+        Some((TerminalQuery::DecCursorPosition, 5))
+    } else if input.starts_with(b"\x1b[6n") {
+        Some((TerminalQuery::CursorPosition, 4))
+    } else if input.starts_with(b"\x1b[5n") {
+        Some((TerminalQuery::Status, 4))
+    } else {
+        None
     }
+}
 
-    if response.is_empty() {
-        return;
-    }
+fn answer_terminal_query(shared: &Shared, query: TerminalQuery) {
+    let response = match query {
+        TerminalQuery::Status => b"\x1b[0n".to_vec(),
+        TerminalQuery::CursorPosition => {
+            let (row, col) = cursor_position(shared);
+            format!("\x1b[{row};{col}R").into_bytes()
+        }
+        TerminalQuery::DecCursorPosition => {
+            let (row, col) = cursor_position(shared);
+            format!("\x1b[?{row};{col}R").into_bytes()
+        }
+    };
 
     let mut writer = shared.pty_writer.lock().expect("pty writer mutex poisoned");
     if let Some(writer) = writer.as_mut() {
@@ -895,11 +959,143 @@ fn respond_to_terminal_queries(shared: &Shared, chunk: &[u8]) {
     }
 }
 
-fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty()
-        && haystack
-            .windows(needle.len())
-            .any(|window| window == needle)
+fn ansi_escape_len(input: &[u8]) -> Option<usize> {
+    if input.len() < 2 || input[0] != 0x1b {
+        return None;
+    }
+
+    match input[1] {
+        b'[' => input
+            .iter()
+            .enumerate()
+            .skip(2)
+            .find(|(_, byte)| (0x40..=0x7e).contains(&**byte))
+            .map(|(index, _)| index + 1),
+        b']' => {
+            let mut i = 2;
+            while i < input.len() {
+                if input[i] == 0x07 {
+                    return Some(i + 1);
+                }
+
+                if input[i] == 0x1b && input.get(i + 1) == Some(&b'\\') {
+                    return Some(i + 2);
+                }
+
+                i += 1;
+            }
+            None
+        }
+        b'O' if input.len() >= 3 => Some(3),
+        _ => Some(2),
+    }
+}
+
+fn update_cursor_from_escape(shared: &Shared, sequence: &[u8]) {
+    if sequence.len() < 3 || !sequence.starts_with(b"\x1b[") {
+        return;
+    }
+
+    let final_byte = *sequence.last().unwrap_or(&0);
+    let params = csi_params(&sequence[2..sequence.len() - 1]);
+    let (rows, cols) = terminal_size(shared);
+    let (mut row, mut col) = cursor_position(shared);
+
+    match final_byte {
+        b'A' => row = row.saturating_sub(csi_param(&params, 0, 1)).max(1),
+        b'B' => row = (row + csi_param(&params, 0, 1)).min(rows),
+        b'C' => col = (col + csi_param(&params, 0, 1)).min(cols),
+        b'D' => col = col.saturating_sub(csi_param(&params, 0, 1)).max(1),
+        b'G' => col = csi_param(&params, 0, 1).clamp(1, cols),
+        b'd' => row = csi_param(&params, 0, 1).clamp(1, rows),
+        b'H' | b'f' => {
+            row = csi_param(&params, 0, 1).clamp(1, rows);
+            col = csi_param(&params, 1, 1).clamp(1, cols);
+        }
+        _ => return,
+    }
+
+    set_cursor_position(shared, row, col);
+}
+
+fn csi_params(input: &[u8]) -> Vec<Option<u64>> {
+    let mut params = Vec::new();
+    let mut current = Vec::new();
+
+    for &byte in input {
+        match byte {
+            b'0'..=b'9' => current.push(byte),
+            b';' => {
+                params.push(parse_csi_param(&current));
+                current.clear();
+            }
+            b'?' | b'>' | b'=' | b' ' => {}
+            _ => current.clear(),
+        }
+    }
+
+    params.push(parse_csi_param(&current));
+    params
+}
+
+fn parse_csi_param(input: &[u8]) -> Option<u64> {
+    if input.is_empty() {
+        None
+    } else {
+        std::str::from_utf8(input).ok()?.parse::<u64>().ok()
+    }
+}
+
+fn csi_param(params: &[Option<u64>], index: usize, default: u64) -> u64 {
+    params.get(index).copied().flatten().unwrap_or(default)
+}
+
+fn update_cursor_from_byte(shared: &Shared, byte: u8) {
+    let (rows, cols) = terminal_size(shared);
+    let (mut row, mut col) = cursor_position(shared);
+
+    match byte {
+        b'\r' => col = 1,
+        b'\n' => row = (row + 1).min(rows),
+        0x08 => col = col.saturating_sub(1).max(1),
+        b'\t' => col = ((col + 7) / 8 * 8 + 1).min(cols),
+        0x20..=0x7e | 0x80..=0xff => {
+            if col >= cols {
+                col = 1;
+                row = (row + 1).min(rows);
+            } else {
+                col += 1;
+            }
+        }
+        _ => {}
+    }
+
+    set_cursor_position(shared, row, col);
+}
+
+fn terminal_size(shared: &Shared) -> (u64, u64) {
+    (
+        shared.terminal_rows.load(Ordering::Relaxed).max(1),
+        shared.terminal_cols.load(Ordering::Relaxed).max(1),
+    )
+}
+
+fn cursor_position(shared: &Shared) -> (u64, u64) {
+    let (rows, cols) = terminal_size(shared);
+    (
+        shared.cursor_row.load(Ordering::Relaxed).clamp(1, rows),
+        shared.cursor_col.load(Ordering::Relaxed).clamp(1, cols),
+    )
+}
+
+fn set_cursor_position(shared: &Shared, row: u64, col: u64) {
+    let (rows, cols) = terminal_size(shared);
+    shared
+        .cursor_row
+        .store(row.clamp(1, rows), Ordering::Relaxed);
+    shared
+        .cursor_col
+        .store(col.clamp(1, cols), Ordering::Relaxed);
 }
 
 fn push_ring(shared: &Shared, chunk: &[u8]) {
@@ -1020,6 +1216,14 @@ fn handle_client(mut stream: TcpStream, shared: Arc<Shared>) {
             FRAME_RESIZE if payload.len() == 4 => {
                 let cols = u16::from_le_bytes([payload[0], payload[1]]);
                 let rows = u16::from_le_bytes([payload[2], payload[3]]);
+                shared
+                    .terminal_cols
+                    .store(u64::from(cols).max(1), Ordering::Relaxed);
+                shared
+                    .terminal_rows
+                    .store(u64::from(rows).max(1), Ordering::Relaxed);
+                let (row, col) = cursor_position(&shared);
+                set_cursor_position(&shared, row, col);
                 let mut master = shared.pty_master.lock().expect("pty master mutex poisoned");
                 if let Some(master) = master.as_mut() {
                     let _ = master.resize(PtySize {
@@ -1235,6 +1439,22 @@ fn normalize_terminal_input(input: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    fn test_shared() -> Shared {
+        Shared {
+            current_client: Mutex::new(None),
+            pty_writer: Mutex::new(None),
+            pty_master: Mutex::new(None),
+            ring: Mutex::new(VecDeque::with_capacity(RING_LIMIT)),
+            exit_code: Mutex::new(None),
+            oom_detected: AtomicBool::new(false),
+            next_client_id: AtomicU64::new(1),
+            terminal_cols: AtomicU64::new(120),
+            terminal_rows: AtomicU64::new(30),
+            cursor_col: AtomicU64::new(1),
+            cursor_row: AtomicU64::new(1),
+        }
+    }
+
     #[test]
     fn preserves_del_backspace_byte_input() {
         assert_eq!(normalize_terminal_input(b"abc\x7f"), b"abc\x7f");
@@ -1261,8 +1481,40 @@ mod tests {
     }
 
     #[test]
+    fn encodes_altgr_brackets_as_printable() {
+        let modifiers =
+            crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::ALT;
+
+        let open = crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('['), modifiers);
+        let close =
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char(']'), modifiers);
+
+        assert_eq!(encode_key_event(open).as_deref(), Some(&b"["[..]));
+        assert_eq!(encode_key_event(close).as_deref(), Some(&b"]"[..]));
+    }
+
+    #[test]
     fn strips_terminal_status_reports() {
         assert_eq!(normalize_terminal_input(b"a\x1b[1;2Rb\x1b[0nc"), b"abc");
+    }
+
+    #[test]
+    fn strips_terminal_queries_from_visible_output() {
+        let shared = test_shared();
+
+        let output = process_terminal_output(&shared, b"a\x1b[6nb\x1b[5nc\x1b[?6nd");
+
+        assert_eq!(output, b"abcd");
+    }
+
+    #[test]
+    fn tracks_cursor_position_from_terminal_output() {
+        let shared = test_shared();
+
+        let output = process_terminal_output(&shared, b"\x1b[10;4H[]");
+
+        assert_eq!(output, b"\x1b[10;4H[]");
+        assert_eq!(cursor_position(&shared), (10, 6));
     }
 
     #[test]
