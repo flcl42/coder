@@ -20,6 +20,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
+#[cfg(windows)]
+use windows_sys::Win32::System::Console::{
+    DISABLE_NEWLINE_AUTO_RETURN, ENABLE_PROCESSED_OUTPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+    GetConsoleMode, GetStdHandle, STD_OUTPUT_HANDLE, SetConsoleMode,
+};
+
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 const INTERNAL_SERVER_ARG: &str = "--coder-server";
@@ -33,6 +41,8 @@ const FRAME_RESIZE: u8 = 11;
 const FRAME_DETACH: u8 = 12;
 
 const DETACH_HINT: &str = "\r\n[coder] Detached. Run `coder` again to reattach.\r\n";
+const CURSOR_SHOW: &[u8] = b"\x1b[?25h";
+const CURSOR_HIDE: &[u8] = b"\x1b[?25l";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ServerConfig {
@@ -92,12 +102,20 @@ struct RunningCodex {
 
 struct RawModeGuard {
     enabled: bool,
+    #[cfg(windows)]
+    _output_mode: Option<WindowsOutputModeGuard>,
 }
 
 impl RawModeGuard {
     fn enable() -> Self {
+        #[cfg(windows)]
+        let output_mode = WindowsOutputModeGuard::enable().ok();
         let enabled = crossterm::terminal::enable_raw_mode().is_ok();
-        Self { enabled }
+        Self {
+            enabled,
+            #[cfg(windows)]
+            _output_mode: output_mode,
+        }
     }
 }
 
@@ -106,6 +124,47 @@ impl Drop for RawModeGuard {
         if self.enabled {
             let _ = crossterm::terminal::disable_raw_mode();
         }
+    }
+}
+
+#[cfg(windows)]
+struct WindowsOutputModeGuard {
+    handle: HANDLE,
+    original_mode: u32,
+}
+
+#[cfg(windows)]
+impl WindowsOutputModeGuard {
+    fn enable() -> io::Result<Self> {
+        let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut original_mode = 0;
+        if unsafe { GetConsoleMode(handle, &mut original_mode) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let new_mode = original_mode
+            | ENABLE_PROCESSED_OUTPUT
+            | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            | DISABLE_NEWLINE_AUTO_RETURN;
+        if unsafe { SetConsoleMode(handle, new_mode) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(Self {
+            handle,
+            original_mode,
+        })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsOutputModeGuard {
+    fn drop(&mut self) {
+        let _ = unsafe { SetConsoleMode(self.handle, self.original_mode) };
     }
 }
 
@@ -492,7 +551,9 @@ fn encode_key_event(event: crossterm::event::KeyEvent) -> Option<Vec<u8>> {
         KeyCode::F(number) => encode_function_key(number, modifiers),
         KeyCode::Char(ch) if alt_gr_printable => ch.to_string().into_bytes(),
         KeyCode::Char(ch) if modifiers.contains(KeyModifiers::CONTROL) => encode_control_char(ch)?,
-        KeyCode::Char(ch) => ch.to_string().into_bytes(),
+        KeyCode::Char(ch) => shifted_printable_char(ch, modifiers)
+            .to_string()
+            .into_bytes(),
         _ => return None,
     };
 
@@ -505,6 +566,38 @@ fn encode_key_event(event: crossterm::event::KeyEvent) -> Option<Vec<u8>> {
         Some(prefixed)
     } else {
         Some(encoded)
+    }
+}
+
+fn shifted_printable_char(ch: char, modifiers: crossterm::event::KeyModifiers) -> char {
+    if !modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
+        return ch;
+    }
+
+    match ch {
+        'a'..='z' => ch.to_ascii_uppercase(),
+        '`' => '~',
+        '1' => '!',
+        '2' => '@',
+        '3' => '#',
+        '4' => '$',
+        '5' => '%',
+        '6' => '^',
+        '7' => '&',
+        '8' => '*',
+        '9' => '(',
+        '0' => ')',
+        '-' => '_',
+        '=' => '+',
+        '[' => '{',
+        ']' => '}',
+        '\\' => '|',
+        ';' => ':',
+        '\'' => '"',
+        ',' => '<',
+        '.' => '>',
+        '/' => '?',
+        _ => ch,
     }
 }
 
@@ -1321,30 +1414,145 @@ fn run_client(mut stream: TcpStream) -> Result<i32> {
         }
     });
 
-    let mut stdout = io::stdout().lock();
-    let mut exit_code = 0;
-    while let Some((kind, payload)) = read_frame(&mut stream)? {
-        match kind {
-            FRAME_STDOUT => {
-                debug_log(format!("foreground stdout frame bytes={}", payload.len()));
-                stdout.write_all(&payload)?;
-                stdout.flush()?;
-            }
-            FRAME_EXIT => {
-                debug_log("foreground exit frame");
-                if payload.len() == 4 {
-                    exit_code =
-                        i32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let (read_tx, read_rx) = mpsc::channel();
+    thread::spawn(move || {
+        loop {
+            match read_frame(&mut stream) {
+                Ok(Some((kind, payload))) => {
+                    if read_tx
+                        .send(ClientReadMessage::Frame(kind, payload))
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
-                break;
+                Ok(None) => {
+                    let _ = read_tx.send(ClientReadMessage::Closed);
+                    break;
+                }
+                Err(err) => {
+                    let _ = read_tx.send(ClientReadMessage::Error(err));
+                    break;
+                }
             }
-            _ => {}
+        }
+    });
+
+    let mut stdout = io::stdout().lock();
+    let mut output_filter = ForegroundOutputFilter::default();
+    let mut exit_code = 0;
+    loop {
+        let message = if output_filter.has_pending_cursor_show() {
+            match read_rx.recv_timeout(Duration::from_millis(25)) {
+                Ok(message) => message,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let filtered = output_filter.flush_pending();
+                    stdout.write_all(&filtered)?;
+                    stdout.flush()?;
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match read_rx.recv() {
+                Ok(message) => message,
+                Err(_) => break,
+            }
+        };
+
+        match message {
+            ClientReadMessage::Frame(kind, payload) => match kind {
+                FRAME_STDOUT => {
+                    debug_log(format!("foreground stdout frame bytes={}", payload.len()));
+                    let filtered = output_filter.process(&payload);
+                    stdout.write_all(&filtered)?;
+                    stdout.flush()?;
+                }
+                FRAME_EXIT => {
+                    debug_log("foreground exit frame");
+                    if payload.len() == 4 {
+                        exit_code =
+                            i32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                    }
+                    break;
+                }
+                _ => {}
+            },
+            ClientReadMessage::Closed => break,
+            ClientReadMessage::Error(err) => return Err(err.into()),
         }
     }
 
+    let filtered = output_filter.flush_pending();
+    stdout.write_all(&filtered)?;
+    stdout.flush()?;
     debug_log("foreground read loop ended");
     input_running.store(false, Ordering::Relaxed);
     Ok(exit_code)
+}
+
+enum ClientReadMessage {
+    Frame(u8, Vec<u8>),
+    Closed,
+    Error(io::Error),
+}
+
+#[derive(Default)]
+struct ForegroundOutputFilter {
+    pending_cursor_show: bool,
+}
+
+impl ForegroundOutputFilter {
+    fn process(&mut self, payload: &[u8]) -> Vec<u8> {
+        let mut output = Vec::with_capacity(payload.len());
+        let mut i = 0;
+
+        while i < payload.len() {
+            if payload[i..].starts_with(CURSOR_SHOW) {
+                self.pending_cursor_show = true;
+                i += CURSOR_SHOW.len();
+                continue;
+            }
+
+            if payload[i..].starts_with(CURSOR_HIDE) {
+                self.pending_cursor_show = false;
+                output.extend_from_slice(CURSOR_HIDE);
+                i += CURSOR_HIDE.len();
+                continue;
+            }
+
+            if payload[i] == 0x1b
+                && let Some(len) = ansi_escape_len(&payload[i..])
+            {
+                output.extend_from_slice(&payload[i..i + len]);
+                i += len;
+                continue;
+            }
+
+            self.flush_pending_cursor_show(&mut output);
+            output.push(payload[i]);
+            i += 1;
+        }
+
+        output
+    }
+
+    fn has_pending_cursor_show(&self) -> bool {
+        self.pending_cursor_show
+    }
+
+    fn flush_pending(&mut self) -> Vec<u8> {
+        let mut output = Vec::new();
+        self.flush_pending_cursor_show(&mut output);
+        output
+    }
+
+    fn flush_pending_cursor_show(&mut self, output: &mut Vec<u8>) {
+        if self.pending_cursor_show {
+            output.extend_from_slice(CURSOR_SHOW);
+            self.pending_cursor_show = false;
+        }
+    }
 }
 
 fn wait_with_socket_alive(running: &AtomicBool, stream: &TcpStream) {
@@ -1532,6 +1740,21 @@ mod tests {
     }
 
     #[test]
+    fn preserves_shifted_bang_input() {
+        let shifted_digit = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('1'),
+            crossterm::event::KeyModifiers::SHIFT,
+        );
+        let shifted_bang = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('!'),
+            crossterm::event::KeyModifiers::SHIFT,
+        );
+
+        assert_eq!(encode_key_event(shifted_digit).as_deref(), Some(&b"!"[..]));
+        assert_eq!(encode_key_event(shifted_bang).as_deref(), Some(&b"!"[..]));
+    }
+
+    #[test]
     fn strips_terminal_status_reports() {
         assert_eq!(normalize_terminal_input(b"a\x1b[1;2Rb\x1b[0nc"), b"abc");
     }
@@ -1566,6 +1789,28 @@ mod tests {
 
         assert_eq!(output, b"\x1b[10;4H[]");
         assert_eq!(cursor_position(&shared), (10, 6));
+    }
+
+    #[test]
+    fn drops_transient_cursor_show_before_redraw_hide() {
+        let mut filter = ForegroundOutputFilter::default();
+
+        let output = filter
+            .process(b"\x1b[18;3H\x1b[?25h\x1b[?2026h\x1b[0 q\x1b[?2026l\x1b[?25l\x1b[14;1Htext");
+
+        assert!(!output.windows(CURSOR_SHOW.len()).any(|w| w == CURSOR_SHOW));
+        assert!(output.windows(CURSOR_HIDE.len()).any(|w| w == CURSOR_HIDE));
+        assert!(output.ends_with(b"text"));
+    }
+
+    #[test]
+    fn preserves_final_cursor_show() {
+        let mut filter = ForegroundOutputFilter::default();
+
+        let output = filter.process(b"\x1b[18;3H\x1b[?25h");
+
+        assert!(!output.ends_with(CURSOR_SHOW));
+        assert!(filter.flush_pending().ends_with(CURSOR_SHOW));
     }
 
     #[test]
