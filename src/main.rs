@@ -859,6 +859,7 @@ fn read_pty_output(
     done_tx: mpsc::Sender<()>,
 ) {
     let mut buf = [0u8; 8192];
+    let mut terminal_output = TerminalOutputFilter::default();
     loop {
         match reader.read(&mut buf) {
             Ok(0) => break,
@@ -868,7 +869,7 @@ fn read_pty_output(
                 if looks_like_oom_output(raw) {
                     shared.oom_detected.store(true, Ordering::Relaxed);
                 }
-                let chunk = process_terminal_output(&shared, raw);
+                let chunk = terminal_output.process(&shared, raw);
                 if chunk.is_empty() {
                     continue;
                 }
@@ -899,32 +900,48 @@ enum TerminalQuery {
     DecCursorPosition,
 }
 
-fn process_terminal_output(shared: &Shared, chunk: &[u8]) -> Vec<u8> {
-    let mut output = Vec::with_capacity(chunk.len());
-    let mut i = 0;
+#[derive(Default)]
+struct TerminalOutputFilter {
+    pending: Vec<u8>,
+}
 
-    while i < chunk.len() {
-        if let Some((query, len)) = terminal_query_at(&chunk[i..]) {
-            answer_terminal_query(shared, query);
-            i += len;
-            continue;
+impl TerminalOutputFilter {
+    fn process(&mut self, shared: &Shared, chunk: &[u8]) -> Vec<u8> {
+        let mut input = Vec::with_capacity(self.pending.len() + chunk.len());
+        input.append(&mut self.pending);
+        input.extend_from_slice(chunk);
+
+        let mut output = Vec::with_capacity(input.len());
+        let mut i = 0;
+
+        while i < input.len() {
+            if let Some((query, len)) = terminal_query_at(&input[i..]) {
+                answer_terminal_query(shared, query);
+                i += len;
+                continue;
+            }
+
+            if input[i] == 0x1b {
+                if starts_incomplete_escape(&input[i..]) {
+                    self.pending.extend_from_slice(&input[i..]);
+                    break;
+                }
+
+                if let Some(len) = ansi_escape_len(&input[i..]) {
+                    update_cursor_from_escape(shared, &input[i..i + len]);
+                    output.extend_from_slice(&input[i..i + len]);
+                    i += len;
+                    continue;
+                }
+            }
+
+            update_cursor_from_byte(shared, input[i]);
+            output.push(input[i]);
+            i += 1;
         }
 
-        if chunk[i] == 0x1b
-            && let Some(len) = ansi_escape_len(&chunk[i..])
-        {
-            update_cursor_from_escape(shared, &chunk[i..i + len]);
-            output.extend_from_slice(&chunk[i..i + len]);
-            i += len;
-            continue;
-        }
-
-        update_cursor_from_byte(shared, chunk[i]);
-        output.push(chunk[i]);
-        i += 1;
+        output
     }
-
-    output
 }
 
 fn terminal_query_at(input: &[u8]) -> Option<(TerminalQuery, usize)> {
@@ -988,6 +1005,23 @@ fn ansi_escape_len(input: &[u8]) -> Option<usize> {
         }
         b'O' if input.len() >= 3 => Some(3),
         _ => Some(2),
+    }
+}
+
+fn starts_incomplete_escape(input: &[u8]) -> bool {
+    if input.is_empty() || input[0] != 0x1b {
+        return false;
+    }
+
+    if input.len() == 1 {
+        return true;
+    }
+
+    match input[1] {
+        b'[' => ansi_escape_len(input).is_none(),
+        b']' => ansi_escape_len(input).is_none(),
+        b'O' => input.len() < 3,
+        _ => false,
     }
 }
 
@@ -1455,6 +1489,10 @@ mod tests {
         }
     }
 
+    fn process_test_output(shared: &Shared, chunk: &[u8]) -> Vec<u8> {
+        TerminalOutputFilter::default().process(shared, chunk)
+    }
+
     #[test]
     fn preserves_del_backspace_byte_input() {
         assert_eq!(normalize_terminal_input(b"abc\x7f"), b"abc\x7f");
@@ -1502,16 +1540,29 @@ mod tests {
     fn strips_terminal_queries_from_visible_output() {
         let shared = test_shared();
 
-        let output = process_terminal_output(&shared, b"a\x1b[6nb\x1b[5nc\x1b[?6nd");
+        let output = process_test_output(&shared, b"a\x1b[6nb\x1b[5nc\x1b[?6nd");
 
         assert_eq!(output, b"abcd");
+    }
+
+    #[test]
+    fn strips_split_terminal_queries_from_visible_output() {
+        let shared = test_shared();
+        let mut filter = TerminalOutputFilter::default();
+
+        assert_eq!(filter.process(&shared, b"a\x1b["), b"a");
+        assert_eq!(filter.process(&shared, b"6"), b"");
+        assert_eq!(filter.process(&shared, b"nb"), b"b");
+        assert_eq!(filter.process(&shared, b"\x1b[?"), b"");
+        assert_eq!(filter.process(&shared, b"6"), b"");
+        assert_eq!(filter.process(&shared, b"nc"), b"c");
     }
 
     #[test]
     fn tracks_cursor_position_from_terminal_output() {
         let shared = test_shared();
 
-        let output = process_terminal_output(&shared, b"\x1b[10;4H[]");
+        let output = process_test_output(&shared, b"\x1b[10;4H[]");
 
         assert_eq!(output, b"\x1b[10;4H[]");
         assert_eq!(cursor_position(&shared), (10, 6));
