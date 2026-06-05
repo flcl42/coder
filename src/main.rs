@@ -82,7 +82,7 @@ enum ServerMessage {
 }
 
 struct Shared {
-    current_client: Mutex<Option<ClientSink>>,
+    clients: Mutex<Vec<ClientSink>>,
     pty_writer: Mutex<Option<Box<dyn Write + Send>>>,
     pty_master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     ring: Mutex<VecDeque<u8>>,
@@ -776,7 +776,7 @@ fn run_server(config: ServerConfig) -> Result<()> {
     debug_log(format!("server listen {}", listener.local_addr()?));
 
     let shared = Arc::new(Shared {
-        current_client: Mutex::new(None),
+        clients: Mutex::new(Vec::new()),
         pty_writer: Mutex::new(None),
         pty_master: Mutex::new(None),
         ring: Mutex::new(VecDeque::with_capacity(RING_LIMIT)),
@@ -1234,27 +1234,22 @@ fn push_ring(shared: &Shared, chunk: &[u8]) {
 }
 
 fn broadcast_output(shared: &Shared, chunk: Vec<u8>) {
-    let current = shared
-        .current_client
-        .lock()
-        .expect("current client mutex poisoned")
-        .clone();
-
-    if let Some(client) = current {
-        let _ = client.tx.send(ServerMessage::Output(chunk));
-    }
+    let mut clients = shared.clients.lock().expect("clients mutex poisoned");
+    clients.retain(|client| client.tx.send(ServerMessage::Output(chunk.clone())).is_ok());
 }
 
 fn broadcast_exit(shared: &Shared, code: i32) {
-    let current = shared
-        .current_client
-        .lock()
-        .expect("current client mutex poisoned")
-        .clone();
+    let mut clients = shared.clients.lock().expect("clients mutex poisoned");
+    clients.retain(|client| client.tx.send(ServerMessage::Exit(code)).is_ok());
+}
 
-    if let Some(client) = current {
-        let _ = client.tx.send(ServerMessage::Exit(code));
-    }
+fn remove_client(shared: &Shared, client_id: u64) {
+    let mut clients = shared.clients.lock().expect("clients mutex poisoned");
+    clients.retain(|client| client.id != client_id);
+}
+
+fn client_count(shared: &Shared) -> usize {
+    shared.clients.lock().expect("clients mutex poisoned").len()
 }
 
 fn handle_client(mut stream: TcpStream, shared: Arc<Shared>) {
@@ -1263,14 +1258,15 @@ fn handle_client(mut stream: TcpStream, shared: Arc<Shared>) {
     let (tx, rx) = mpsc::channel();
 
     {
-        let mut current = shared
-            .current_client
-            .lock()
-            .expect("current client mutex poisoned");
-        *current = Some(ClientSink {
+        let mut clients = shared.clients.lock().expect("clients mutex poisoned");
+        clients.push(ClientSink {
             id: client_id,
             tx: tx.clone(),
         });
+        debug_log(format!(
+            "client {client_id} attached clients={}",
+            clients.len()
+        ));
     }
 
     let mut initial = b"\x1b[2J\x1b[H".to_vec();
@@ -1288,7 +1284,10 @@ fn handle_client(mut stream: TcpStream, shared: Arc<Shared>) {
 
     let mut write_stream = match stream.try_clone() {
         Ok(stream) => stream,
-        Err(_) => return,
+        Err(_) => {
+            remove_client(&shared, client_id);
+            return;
+        }
     };
 
     thread::spawn(move || {
@@ -1310,7 +1309,6 @@ fn handle_client(mut stream: TcpStream, shared: Arc<Shared>) {
         debug_log("client writer ended");
     });
 
-    let mut clear_current = false;
     loop {
         let frame = match read_frame(&mut stream) {
             Ok(Some(frame)) => frame,
@@ -1323,11 +1321,6 @@ fn handle_client(mut stream: TcpStream, shared: Arc<Shared>) {
                 break;
             }
         };
-
-        if !is_current_client(&shared, client_id) {
-            debug_log(format!("client {client_id} no longer current"));
-            break;
-        }
 
         let (kind, payload) = frame;
         match kind {
@@ -1363,7 +1356,6 @@ fn handle_client(mut stream: TcpStream, shared: Arc<Shared>) {
             }
             FRAME_DETACH => {
                 debug_log(format!("client {client_id} explicit detach"));
-                clear_current = true;
                 break;
             }
             _ => {}
@@ -1371,29 +1363,11 @@ fn handle_client(mut stream: TcpStream, shared: Arc<Shared>) {
     }
 
     debug_log(format!("client {client_id} input loop ended"));
-    if clear_current {
-        let mut current = shared
-            .current_client
-            .lock()
-            .expect("current client mutex poisoned");
-        if current
-            .as_ref()
-            .map(|client| client.id == client_id)
-            .unwrap_or(false)
-        {
-            *current = None;
-        }
-    }
-}
-
-fn is_current_client(shared: &Shared, client_id: u64) -> bool {
-    shared
-        .current_client
-        .lock()
-        .expect("current client mutex poisoned")
-        .as_ref()
-        .map(|client| client.id == client_id)
-        .unwrap_or(false)
+    remove_client(&shared, client_id);
+    debug_log(format!(
+        "client {client_id} detached clients={}",
+        client_count(&shared)
+    ));
 }
 
 fn run_client(mut stream: TcpStream) -> Result<i32> {
@@ -1683,7 +1657,7 @@ mod tests {
 
     fn test_shared() -> Shared {
         Shared {
-            current_client: Mutex::new(None),
+            clients: Mutex::new(Vec::new()),
             pty_writer: Mutex::new(None),
             pty_master: Mutex::new(None),
             ring: Mutex::new(VecDeque::with_capacity(RING_LIMIT)),
@@ -1704,6 +1678,65 @@ mod tests {
     #[test]
     fn preserves_del_backspace_byte_input() {
         assert_eq!(normalize_terminal_input(b"abc\x7f"), b"abc\x7f");
+    }
+
+    #[test]
+    fn broadcasts_output_to_all_clients() {
+        let shared = test_shared();
+        let (first_tx, first_rx) = mpsc::channel();
+        let (second_tx, second_rx) = mpsc::channel();
+
+        {
+            let mut clients = shared.clients.lock().expect("clients mutex poisoned");
+            clients.push(ClientSink {
+                id: 1,
+                tx: first_tx,
+            });
+            clients.push(ClientSink {
+                id: 2,
+                tx: second_tx,
+            });
+        }
+
+        broadcast_output(&shared, b"hello".to_vec());
+
+        match first_rx.recv_timeout(Duration::from_millis(100)).unwrap() {
+            ServerMessage::Output(chunk) => assert_eq!(chunk, b"hello"),
+            ServerMessage::Exit(code) => panic!("unexpected exit {code}"),
+        }
+        match second_rx.recv_timeout(Duration::from_millis(100)).unwrap() {
+            ServerMessage::Output(chunk) => assert_eq!(chunk, b"hello"),
+            ServerMessage::Exit(code) => panic!("unexpected exit {code}"),
+        }
+    }
+
+    #[test]
+    fn removing_one_client_keeps_others_attached() {
+        let shared = test_shared();
+        let (first_tx, first_rx) = mpsc::channel();
+        let (second_tx, second_rx) = mpsc::channel();
+
+        {
+            let mut clients = shared.clients.lock().expect("clients mutex poisoned");
+            clients.push(ClientSink {
+                id: 1,
+                tx: first_tx,
+            });
+            clients.push(ClientSink {
+                id: 2,
+                tx: second_tx,
+            });
+        }
+
+        remove_client(&shared, 1);
+        assert_eq!(client_count(&shared), 1);
+        broadcast_exit(&shared, 42);
+
+        assert!(first_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        match second_rx.recv_timeout(Duration::from_millis(100)).unwrap() {
+            ServerMessage::Exit(code) => assert_eq!(code, 42),
+            ServerMessage::Output(chunk) => panic!("unexpected output {chunk:?}"),
+        }
     }
 
     #[test]

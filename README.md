@@ -14,6 +14,9 @@ coder resume
 ```
 
 While attached, press `Ctrl+]` to detach without stopping Codex.
+Multiple `coder` foreground processes can attach to the same running broker at
+the same time. They share the same Codex pseudo-terminal; detaching one client
+does not detach or interrupt the others.
 
 The wrapper does not reserve public command-line arguments. Arguments are passed
 to Codex. Plain `coder` and plain `coder resume` reattach to the default broker
