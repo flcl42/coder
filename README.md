@@ -23,10 +23,9 @@ to Codex. Plain `coder` and plain `coder resume` reattach to the default broker
 when one exists. Targeted resumes such as `coder resume <session-id>` get their
 own broker key, so separate resumed sessions do not steal each other's terminal.
 
-Set `CODER_CODEX` to override the program used for Codex. By default this machine
-uses `C:\Programs\nodejs\node.exe` with the installed Codex JavaScript entrypoint.
-If Codex cannot be found, `coder` exits with a message explaining how to install
-Codex or set `CODER_CODEX`.
+Set `CODER_CODEX` to override the program used for Codex. If Codex cannot be
+found, `coder` exits with a message explaining how to install Codex or set
+`CODER_CODEX`.
 
 Set `CODER_SESSION` to use a separate broker name:
 
@@ -46,27 +45,26 @@ built with the static CRT, and macOS is shipped as a universal binary.
 Linux, bash:
 
 ```bash
-repo=flcl42/coder; mkdir -p "$HOME/.local/bin"; curl -fsSL "https://github.com/$repo/releases/latest/download/coder-linux-x86_64" -o "$HOME/.local/bin/coder"; chmod +x "$HOME/.local/bin/coder"; grep -qxF 'export PATH="$HOME/.local/bin:$PATH"' "$HOME/.bashrc" || echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc"
+repo=flcl42/coder; curl -fsSL "https://github.com/$repo/releases/latest/download/coder-linux-x86_64" -o ./coder; chmod +x ./coder
 ```
 
 macOS, zsh:
 
 ```zsh
-repo=flcl42/coder; mkdir -p "$HOME/.local/bin"; curl -fsSL "https://github.com/$repo/releases/latest/download/coder-macos-universal" -o "$HOME/.local/bin/coder"; chmod +x "$HOME/.local/bin/coder"; grep -qxF 'export PATH="$HOME/.local/bin:$PATH"' "$HOME/.zshrc" || echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.zshrc"
+repo=flcl42/coder; curl -fsSL "https://github.com/$repo/releases/latest/download/coder-macos-universal" -o ./coder; chmod +x ./coder
 ```
 
 Windows, PowerShell:
 
 ```powershell
-$repo='flcl42/coder'; $dir='C:\Programs'; New-Item -ItemType Directory -Force $dir | Out-Null; Invoke-WebRequest "https://github.com/$repo/releases/latest/download/coder-windows-x86_64.exe" -OutFile "$dir\coder.exe"; $p=[Environment]::GetEnvironmentVariable('Path','User'); if (($p -split ';') -notcontains $dir) { [Environment]::SetEnvironmentVariable('Path', ((@($p -split ';') + $dir | Where-Object { $_ }) -join ';'), 'User'); $env:Path += ";$dir" }
+$repo='flcl42/coder'; Invoke-WebRequest "https://github.com/$repo/releases/latest/download/coder-windows-x86_64.exe" -OutFile ".\coder.exe"
 ```
 
 ## Development
 
-When publishing an updated build to `C:\Programs\coder.exe`, stop any running
-`coder.exe` broker/client processes first if they lock the file, then replace the
-binary directly. Do not leave a separate fixed-name executable as the normal
-test path.
+When replacing a local `coder.exe`, stop any running broker/client processes
+first if they lock the file, then replace the binary directly. Do not leave a
+separate fixed-name executable as the normal test path.
 
 Exception: for input-handling fixes or other changes where preserving active
 sessions is more important than immediate install, do not stop live `coder.exe`
